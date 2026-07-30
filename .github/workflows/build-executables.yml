@@ -1,0 +1,46 @@
+name: Build executables
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: zettellinker-windows-x64
+            executable: dist/zettellinker.exe
+          - os: ubuntu-22.04
+            artifact: zettellinker-linux-x64
+            executable: dist/zettellinker
+          - os: macos-13
+            artifact: zettellinker-macos-x64
+            executable: dist/zettellinker
+          - os: macos-14
+            artifact: zettellinker-macos-arm64
+            executable: dist/zettellinker
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -e ".[build,test]"
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build and smoke-test executable
+        run: python scripts/build_executable.py
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.executable }}
+          if-no-files-found: error

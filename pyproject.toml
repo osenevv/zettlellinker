@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zettellinker"
+version = "0.1.0"
+description = "Fast, local semantic linking and graph health for Obsidian vaults"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ZettelLinker contributors" }]
+dependencies = [
+  "numpy>=1.26",
+  "platformdirs>=4.2",
+  "PyYAML>=6.0",
+  "sentence-transformers>=3.0",
+  "usearch==2.16.9",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.11,<7"]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+zettellinker = "zettellinker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zettellinker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
