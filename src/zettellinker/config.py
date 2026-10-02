@@ -18,6 +18,8 @@ DEFAULT_CHUNK_OVERLAP_WORDS = 30
 DEFAULT_HNSW_CONNECTIVITY = 16
 DEFAULT_HNSW_EXPANSION_ADD = 128
 DEFAULT_HNSW_EXPANSION_SEARCH = 64
+DEFAULT_INDEX = "exact"
+VALID_INDEXES = {"exact", "usearch"}
 
 MIN_SIMILARITY_THRESHOLD = 0.0
 MAX_SIMILARITY_THRESHOLD = 1.0
@@ -54,6 +56,7 @@ class SemanticConfig:
     hnsw_connectivity: int = DEFAULT_HNSW_CONNECTIVITY
     hnsw_expansion_add: int = DEFAULT_HNSW_EXPANSION_ADD
     hnsw_expansion_search: int = DEFAULT_HNSW_EXPANSION_SEARCH
+    index: str = DEFAULT_INDEX
 
 
 @dataclass
@@ -108,6 +111,9 @@ class VaultConfig:
 
         if self.semantic.chunk_overlap_words >= self.semantic.chunk_words:
             raise ValueError("chunk overlap must be smaller than chunk size")
+
+        if self.semantic.index not in VALID_INDEXES:
+            raise ValueError("semantic.index must be 'exact' or 'usearch'")
 
         if self.audits.reciprocal_mode not in VALID_RECIPROCAL_MODES:
             raise ValueError("audits.reciprocal_mode must be 'off' or 'audit'")
@@ -176,11 +182,7 @@ def save_config(path: Path, config: VaultConfig) -> None:
         "# Automatic note editing is disabled until auto_write.enabled is true.\n"
     )
     payload = yaml.safe_dump(asdict(config), sort_keys=False, allow_unicode=True)
-    try:
-        path.write_text(header + payload, encoding="utf-8")
-    except (PermissionError, OSError):
-        user_home_config = Path.home() / CONFIG_NAME
-        user_home_config.write_text(header + payload, encoding="utf-8")
+    path.write_text(header + payload, encoding="utf-8")
 
 
 GLOBAL_CONFIG_PATH = Path.home() / ".zettellinker_app.yml"
@@ -199,17 +201,41 @@ def get_last_vault_path() -> str:
     return ""
 
 
+def _read_app_state() -> dict[str, Any]:
+    if not GLOBAL_CONFIG_PATH.exists():
+        return {}
+    try:
+        data = yaml.safe_load(GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_app_state(data: dict[str, Any]) -> None:
+    GLOBAL_CONFIG_PATH.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
 def save_last_vault_path(vault_path: Path | str) -> None:
     """Persist the last loaded vault directory path for future app sessions."""
     try:
-        resolved = str(Path(vault_path).resolve())
-        data: dict[str, Any] = {}
-        if GLOBAL_CONFIG_PATH.exists():
-            data = yaml.safe_load(GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-            if not isinstance(data, dict):
-                data = {}
-        data["last_vault_path"] = resolved
-        GLOBAL_CONFIG_PATH.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        data = _read_app_state()
+        data["last_vault_path"] = str(Path(vault_path).resolve())
+        _write_app_state(data)
+    except Exception:
+        pass
+
+
+def get_dark_mode() -> bool:
+    """Return the desktop appearance saved beside the last vault path."""
+    return _read_app_state().get("dark_mode") is True
+
+
+def save_dark_mode(enabled: bool) -> None:
+    """Remember the sun/moon choice without dropping the last vault path."""
+    try:
+        data = _read_app_state()
+        data["dark_mode"] = bool(enabled)
+        _write_app_state(data)
     except Exception:
         pass
 

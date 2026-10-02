@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -13,14 +14,55 @@ from typing import Any
 from .config import (
     CONFIG_NAME,
     VaultConfig,
+    get_dark_mode,
     get_last_vault_path,
     load_config,
     save_config,
+    save_dark_mode,
     save_last_vault_path,
 )
-from .models import DoctorCheck
-from .semantic import SemanticEngine
-from .vault import VaultGraph, discover_notes
+
+# Dark colors only. Light mode keeps the window's original clam colors
+# and the black console with green text.
+THEME_DARK = {
+    "bg": "#15181d",
+    "card": "#1d2229",
+    "raised": "#232a33",
+    "soft": "#272e37",
+    "text": "#f0f3f7",
+    "muted": "#aab4c1",
+    "line": "#37414d",
+    "log_bg": "#0f1217",
+    "log_fg": "#b7f7d1",
+    "selected": "#31436f",
+}
+LIGHT_LOG_BG = "#000"
+LIGHT_LOG_FG = "#00ff66"
+# Clam draws entry and tree interiors from -window, and does not store that
+# color on TEntry. A dark fieldbackground therefore survives the toggle.
+LIGHT_FIELD = "#ffffff"
+SUN = "☀"
+MOON = "☾"
+
+
+def _hex_luminance(color: str) -> float:
+    value = str(color or "").lstrip("#")
+    if len(value) != 6:
+        return 1.0
+    try:
+        red, green, blue = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except ValueError:
+        return 1.0
+    return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255
+
+
+def contrast_fg(background: str) -> str:
+    """Pick light or dark label paint so button text stays readable."""
+    return "#f4f6f8" if _hex_luminance(background) < 0.55 else "#141820"
+
+
+from .vault import discover_notes
+from .workflow import run_note_suggest, run_vault_scan
 from .writer import LinkWriter, undo_last
 
 
@@ -36,7 +78,8 @@ class ZettelLinkerApp:
         self.style.theme_use("clam")
 
         self.current_suggestions: list[Any] = []
-        self.current_engine: SemanticEngine | None = None
+        self.current_findings: list[Any] = []
+        self.current_engine: Any | None = None
         self.sort_column_name: str = "score"
         self.sort_reverse: bool = True
         self.vault_path_var = tk.StringVar(value="")
@@ -51,6 +94,8 @@ class ZettelLinkerApp:
         self.cached_note_names: list[str] = []
         self.suggest_popup: tk.Toplevel | None = None
         self.suggest_listbox: tk.Listbox | None = None
+        self.dark_mode = get_dark_mode()
+        self._native_root_bg = self.root.cget("bg")
         self.root.title("ZettelLinker - Obsidian Semantic Linker")
         self.root.geometry("900x680")
         self.root.minsize(760, 560)
@@ -58,7 +103,216 @@ class ZettelLinkerApp:
         self._build_ui()
         self._load_initial_config()
 
+    def _toggle_theme(self) -> None:
+        self.dark_mode = not self.dark_mode
+        self._apply_theme()
+        save_dark_mode(self.dark_mode)
+
+    def _style_theme_button(self, background: str, foreground: str) -> None:
+        self.style.configure(
+            "Zettel.Theme.TButton",
+            background=background,
+            foreground=foreground,
+            bordercolor=background,
+            lightcolor=background,
+            darkcolor=background,
+            padding=(1, 0),
+            font=("TkDefaultFont", 12),
+            relief="flat",
+            borderwidth=0,
+            anchor="center",
+        )
+        self.style.map(
+            "Zettel.Theme.TButton",
+            background=[("pressed", background), ("active", background)],
+            foreground=[("pressed", foreground), ("active", foreground)],
+        )
+
+    def _snapshot_light_styles(self) -> None:
+        tracked = {
+            ".": ("background", "foreground"),
+            "TFrame": ("background",),
+            "TLabel": ("background", "foreground"),
+            "TLabelframe": ("background", "foreground", "bordercolor", "lightcolor", "darkcolor"),
+            "TLabelframe.Label": ("background", "foreground"),
+            "TEntry": ("fieldbackground", "foreground", "bordercolor", "lightcolor", "darkcolor"),
+            "TButton": ("background", "foreground", "bordercolor", "lightcolor", "darkcolor", "padding", "relief"),
+            "Treeview": ("background", "fieldbackground", "foreground", "bordercolor"),
+            "Treeview.Heading": ("background", "foreground", "bordercolor"),
+            "Vertical.TScrollbar": ("background", "troughcolor", "bordercolor", "arrowcolor"),
+        }
+        self._light_styles = {
+            name: {option: self.style.lookup(name, option) for option in options}
+            for name, options in tracked.items()
+        }
+        self._light_maps = {
+            name: self.style.map(name) for name in ("TButton", "Treeview", "Treeview.Heading")
+        }
+
+    def _restore_light_styles(self) -> None:
+        for name, options in self._light_styles.items():
+            values = {option: value for option, value in options.items() if value}
+            if values:
+                self.style.configure(name, **values)
+        for name, spec in self._light_maps.items():
+            if spec:
+                self.style.map(name, **spec)
+        self.style.configure("TEntry", fieldbackground=LIGHT_FIELD)
+        if not self._light_styles["Treeview"].get("fieldbackground"):
+            self.style.configure("Treeview", fieldbackground=LIGHT_FIELD)
+
+    def _apply_theme(self) -> None:
+        """Dark mode repaints the window. Light mode restores the original colors."""
+        self.style.theme_use("clam")
+        if not hasattr(self, "_light_styles"):
+            self._snapshot_light_styles()
+        self.theme_button.configure(text=MOON if self.dark_mode else SUN)
+        self.theme_tip.text = "Use light mode" if self.dark_mode else "Use dark mode"
+        if not self.dark_mode:
+            self._restore_light_styles()
+            self.root.configure(bg=self._native_root_bg)
+            self.root._zettel_palette = None
+            button_bg = self._light_styles["TButton"].get("background") or self._native_root_bg
+            button_fg = self._light_styles["TButton"].get("foreground") or "#000000"
+            self._style_theme_button(button_bg, button_fg)
+            self.log_text.configure(bg=LIGHT_LOG_BG, fg=LIGHT_LOG_FG, insertbackground=LIGHT_LOG_FG)
+            self._paint_suggest_popup()
+            return
+
+        palette = THEME_DARK
+        self.root._zettel_palette = palette
+        self.root.configure(bg=palette["bg"])
+        style = self.style
+        button_fg = contrast_fg(palette["card"])
+        style.configure(".", background=palette["bg"], foreground=palette["text"])
+        style.configure("TFrame", background=palette["bg"])
+        style.configure("TLabel", background=palette["bg"], foreground=palette["text"])
+        style.configure(
+            "TLabelframe",
+            background=palette["bg"],
+            foreground=palette["text"],
+            bordercolor=palette["line"],
+            lightcolor=palette["line"],
+            darkcolor=palette["line"],
+        )
+        style.configure("TLabelframe.Label", background=palette["bg"], foreground=palette["muted"])
+        style.configure(
+            "TEntry",
+            fieldbackground=palette["raised"],
+            foreground=palette["text"],
+            bordercolor=palette["line"],
+            lightcolor=palette["line"],
+            darkcolor=palette["line"],
+        )
+        style.configure(
+            "TButton",
+            background=palette["card"],
+            foreground=button_fg,
+            bordercolor=palette["line"],
+            lightcolor=palette["line"],
+            darkcolor=palette["line"],
+        )
+        style.map(
+            "TButton",
+            background=[("disabled", palette["soft"]), ("pressed", palette["soft"]), ("active", palette["soft"])],
+            foreground=[
+                ("disabled", contrast_fg(palette["soft"])),
+                ("pressed", button_fg),
+                ("active", button_fg),
+            ],
+        )
+        self._style_theme_button(palette["bg"], palette["text"])
+        style.configure(
+            "Treeview",
+            background=palette["card"],
+            fieldbackground=palette["card"],
+            foreground=palette["text"],
+            bordercolor=palette["line"],
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", palette["selected"])],
+            foreground=[("selected", palette["text"])],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=palette["soft"],
+            foreground=palette["muted"],
+            bordercolor=palette["line"],
+        )
+        style.map("Treeview.Heading", background=[("active", palette["soft"])])
+        style.configure(
+            "Vertical.TScrollbar",
+            background=palette["soft"],
+            troughcolor=palette["bg"],
+            bordercolor=palette["line"],
+            arrowcolor=palette["muted"],
+        )
+        self.log_text.configure(
+            bg=palette["log_bg"],
+            fg=palette["log_fg"],
+            insertbackground=palette["log_fg"],
+            highlightbackground=palette["line"],
+            highlightcolor=palette["line"],
+        )
+        self._paint_suggest_popup()
+
+    def _paint_suggest_popup(self) -> None:
+        box = self.suggest_listbox
+        if box is None:
+            return
+        try:
+            if not box.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self.dark_mode:
+            palette = THEME_DARK
+            box.configure(
+                bg=palette["raised"],
+                fg=palette["text"],
+                selectbackground=palette["selected"],
+                selectforeground=palette["text"],
+                highlightbackground=palette["line"],
+            )
+            if self.suggest_popup is not None:
+                self.suggest_popup.configure(bg=palette["line"])
+            return
+        box.configure(
+            bg="#FFFFFF",
+            fg="#000000",
+            selectbackground="#007ACC",
+            selectforeground="#FFFFFF",
+            highlightbackground="#FFFFFF",
+        )
+
+    def _menu(self) -> tk.Menu:
+        if not self.dark_mode:
+            return tk.Menu(self.root, tearoff=0)
+        palette = THEME_DARK
+        return tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=palette["card"],
+            fg=palette["text"],
+            activebackground=palette["selected"],
+            activeforeground=palette["text"],
+        )
+
     def _build_ui(self) -> None:
+        bar = ttk.Frame(self.root)
+        bar.pack(fill=tk.X)
+        self.theme_button = ttk.Button(
+            bar,
+            text=SUN,
+            command=self._toggle_theme,
+            style="Zettel.Theme.TButton",
+            width=2,
+            cursor="hand2",
+        )
+        self.theme_button.pack(side=tk.RIGHT, padx=(0, 8), pady=(4, 0))
+        self.theme_tip = ToolTip(self.theme_button, "Use dark mode")
+
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -216,7 +470,8 @@ class ZettelLinkerApp:
         log_frame = ttk.LabelFrame(main, text=" Console Log ", padding=6)
         log_frame.pack(fill=tk.X)
 
-        self.log_text = tk.Text(log_frame, height=8, font=("Courier", 11), bg="#000", fg="#00ff66")
+        self.log_text = tk.Text(log_frame, height=8, font=("Courier", 11), bg=LIGHT_LOG_BG, fg=LIGHT_LOG_FG)
+        self._apply_theme()
         log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
@@ -472,7 +727,7 @@ class ZettelLinkerApp:
                         selected_suggestions.append(s)
                         break
 
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = self._menu()
 
         apply_label = f"Apply {len(selected_suggestions)} Selected Connection{'s' if len(selected_suggestions) > 1 else ''}"
         menu.add_command(
@@ -619,7 +874,7 @@ class ZettelLinkerApp:
             messagebox.showwarning("No Data", "No link suggestions available to export. Run a scan first.")
             return
 
-        menu = tk.Menu(self.root, tearoff=0)
+        menu = self._menu()
         menu.add_command(label="Export to CSV (.csv)", command=self.on_export_csv)
         menu.add_command(label="Export to Markdown (.md)", command=self.on_export_md)
 
@@ -731,27 +986,42 @@ class ZettelLinkerApp:
         def _work():
             try:
                 vault, config = self._get_current_config()
-                self.root.after(0, lambda v=vault, c=config: self.log(f"Scanning vault '{v.name}' (threshold={c.semantic.threshold}, limit={c.semantic.limit})..."))
-                notes = discover_notes(vault, config)
-                self.root.after(0, lambda n=notes: self.log(f"Discovered {len(n)} notes in vault."))
-
+                preview = _preview_config(config)
+                self.root.after(0, lambda v=vault, c=preview: self.log(f"Scanning vault '{v.name}' (threshold={c.semantic.threshold}, limit={c.semantic.limit})..."))
                 progress_cb = lambda msg: self.root.after(0, lambda m=msg: self.log(m))
-                engine = SemanticEngine(vault, config, progress=progress_cb)
-                stats = engine.refresh(notes)
-                suggestions = engine.all_suggestions()
+                state = run_vault_scan(vault, preview, progress=progress_cb)
+                suggestions = state.get("suggestions", [])
+                findings = state.get("audit_findings", [])
+                stats = state.get("index_stats")
+                self.current_engine = state.get("engine")
 
-                self.current_engine = engine
-
-                self.root.after(0, lambda: self._on_scan_complete(suggestions, stats))
+                self.root.after(0, lambda: self._on_scan_complete(suggestions, stats, findings))
             except Exception as exc:
                 self.root.after(0, lambda: self._on_scan_error(str(exc)))
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _on_scan_complete(self, suggestions: list[Any], stats: Any) -> None:
+    def _on_scan_complete(self, suggestions: list[Any], stats: Any, findings: list[Any] | None = None) -> None:
         self.scan_btn.config(state=tk.NORMAL)
-        self.log(f"Scan complete: {len(suggestions)} suggestions found ({stats.embedded} embedded, {stats.reused} reused). Review suggestions below and click 'Apply Connections' to write links.")
+        embedded = stats.embedded if stats else 0
+        reused = stats.reused if stats else 0
+        self.log(
+            f"Scan complete: {len(suggestions)} suggestions found "
+            f"({embedded} embedded, {reused} reused). "
+            "Review suggestions below and click 'Apply Connections' to write links."
+        )
+        self._log_findings(findings or [])
         self._render_suggestions(suggestions)
+
+    def _log_findings(self, findings: list[Any]) -> None:
+        self.current_findings = list(findings)
+        if not findings:
+            self.log("Audit: no ghost links, ambiguous links, or orphan notes.")
+            return
+        self.log(f"Audit findings: {len(findings)}")
+        for finding in findings:
+            target = f" -> {finding.target}" if finding.target else ""
+            self.log(f"  {finding.kind}: {finding.source}{target}")
 
     def on_apply_connections(self) -> None:
         if not self.current_suggestions or not self.current_engine:
@@ -781,9 +1051,16 @@ class ZettelLinkerApp:
 
     def _on_apply_complete(self, tx: Any) -> None:
         self.apply_btn.config(state=tk.NORMAL)
-        if tx:
-            self.log(f"Successfully applied connections! Transaction ID: {tx.transaction_id} ({len(tx.restored_files)} files modified).")
-            messagebox.showinfo("Apply Complete", f"Successfully applied connections!\nModified {len(tx.restored_files)} files.\n\nClick 'Undo Write' anytime to revert.")
+        if tx and tx.transaction:
+            self.log(
+                f"Successfully applied connections. Transaction {tx.transaction} "
+                f"({len(tx.modified)} files modified, {tx.links_added} links)."
+            )
+            messagebox.showinfo(
+                "Apply Complete",
+                f"Successfully applied connections.\nModified {len(tx.modified)} files.\n\n"
+                "Click 'Undo Write' anytime to revert.",
+            )
         else:
             self.log("No new links were written (notes already contain these connections).")
             messagebox.showinfo("Apply Complete", "No new links were written (all suggested connections already exist in notes).")
@@ -817,19 +1094,13 @@ class ZettelLinkerApp:
         def _work():
             try:
                 vault, config = self._get_current_config()
-                notes = discover_notes(vault, config)
+                preview = _preview_config(config)
                 progress_cb = lambda msg: self.root.after(0, lambda m=msg: self.log(m))
-                engine = SemanticEngine(vault, config, progress=progress_cb)
-                engine.refresh(notes)
-                matched = [n for n in notes if n.name.lower() == note_name.lower() or str(n.relative_path).lower() == note_name.lower() or n.identity.lower() == note_name.lower()]
-                target_note = matched[0] if matched else None
-
-                if not target_note:
-                    self.root.after(0, lambda: self.log(f"Note '{note_name}' not found in vault."))
-                    return
-
-                suggestions = engine.suggest_for_note(target_note)
-                self.root.after(0, lambda: self._on_suggest_complete(suggestions, target_note.name))
+                state = run_note_suggest(vault, preview, note_name, progress=progress_cb)
+                self.current_engine = state.get("engine")
+                suggestions = state.get("suggestions", [])
+                identity = state.get("note", note_name)
+                self.root.after(0, lambda: self._on_suggest_complete(suggestions, identity))
             except Exception as exc:
                 self.root.after(0, lambda: self.log(f"Suggest error: {exc}"))
 
@@ -861,7 +1132,7 @@ class ZettelLinkerApp:
             try:
                 vault, config = self._get_current_config()
                 notes = discover_notes(vault, config)
-                self.cached_note_names = [n.name for n in notes]
+                self.cached_note_names = [n.basename for n in notes]
             except Exception:
                 self.cached_note_names = []
 
@@ -890,6 +1161,7 @@ class ZettelLinkerApp:
                 borderwidth=1,
             )
             self.suggest_listbox.pack(fill=tk.BOTH, expand=True)
+            self._paint_suggest_popup()
             self.suggest_listbox.bind("<ButtonRelease-1>", self._on_select_suggest_item)
             self.suggest_listbox.bind("<Return>", self._on_select_suggest_item)
             self.suggest_listbox.bind("<Escape>", lambda _e: self._hide_suggest_dropdown())
@@ -927,9 +1199,9 @@ class ZettelLinkerApp:
         self.log("Executing undo...")
         try:
             tx = undo_last(vault)
-            if tx:
-                self.log(f"Restored {len(tx.restored_files)} files from transaction {tx.transaction_id}")
-                messagebox.showinfo("Undo Complete", f"Restored {len(tx.restored_files)} files.")
+            if tx.transaction:
+                self.log(f"Restored {len(tx.modified)} files from transaction {tx.transaction}")
+                messagebox.showinfo("Undo Complete", f"Restored {len(tx.modified)} files.")
             else:
                 self.log("No transaction available to undo.")
                 messagebox.showinfo("Undo", "No previous write transaction to undo.")
@@ -955,12 +1227,15 @@ class ToolTip:
             x = self.widget.winfo_rootx() - parent.winfo_rootx() + 10
             y = self.widget.winfo_rooty() - parent.winfo_rooty() + self.widget.winfo_height() + 2
 
+            palette = getattr(parent, "_zettel_palette", None)
+            tip_bg = palette["raised"] if palette else "#2D2D2D"
+            tip_fg = palette["text"] if palette else "#FFFFFF"
             self.tip_label = tk.Label(
                 parent,
                 text=self.text,
                 justify=tk.LEFT,
-                background="#2D2D2D",
-                foreground="#FFFFFF",
+                background=tip_bg,
+                foreground=tip_fg,
                 relief=tk.SOLID,
                 borderwidth=1,
                 font=("sans-serif", 9, "normal"),
@@ -980,6 +1255,11 @@ class ToolTip:
             except Exception:
                 pass
             self.tip_label = None
+
+
+def _preview_config(config: VaultConfig) -> VaultConfig:
+    """Scan and suggest in the window stay previews. Apply is the only writer."""
+    return replace(config, auto_write=replace(config.auto_write, enabled=False))
 
 
 def run_gui_app() -> None:

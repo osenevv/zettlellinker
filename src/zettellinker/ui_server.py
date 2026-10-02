@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import urllib.parse
 import webbrowser
 from http import HTTPStatus
@@ -9,11 +8,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-from .config import CONFIG_NAME, VaultConfig, load_config, save_config
-from .models import DoctorCheck
-from .semantic import SemanticEngine, mark_model_downloaded, model_download_confirmed
-from .vault import VaultGraph, discover_notes, normalize_identity
-from .writer import LinkWriter, undo_last
+from .cli import doctor_checks
+from .config import CONFIG_NAME, load_config, save_config
+from .workflow import run_note_suggest, run_vault_scan
+from .writer import undo_last
 
 
 HTML_CONTENT = """<!DOCTYPE html>
@@ -412,15 +410,7 @@ class ZettelLinkerRequestHandler(BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(parsed.query)
             vault_str = params.get("vault", [""])[0]
             vault = Path(vault_str).expanduser().resolve() if vault_str else Path.cwd()
-            checks = {
-                "python": {"ok": sys.version_info >= (3, 11), "value": sys.version.split()[0]},
-                "vault_readable": {"ok": vault.exists() and vault.is_dir(), "value": str(vault)},
-            }
-            try:
-                load_config(vault)
-                checks["config"] = {"ok": True, "value": str(vault / CONFIG_NAME)}
-            except Exception as exc:
-                checks["config"] = {"ok": False, "value": str(exc)}
+            checks = doctor_checks(vault)
             ok = all(check["ok"] for check in checks.values())
             self._send_json({"ok": ok, "checks": checks})
             return
@@ -505,17 +495,15 @@ class ZettelLinkerRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/scan":
             try:
                 config = load_config(vault)
-                notes = discover_notes(vault, config)
-                engine = SemanticEngine(vault, config)
-                stats = engine.refresh(notes)
-                suggestions = engine.all_suggestions()
-                findings = engine.graph.findings(config) if engine.graph else []
-                write_result = None
-                if config.auto_write.enabled:
-                    write_result = LinkWriter(engine).apply(suggestions)
+                state = run_vault_scan(vault, config)
+                suggestions = state.get("suggestions", [])
+                findings = state.get("audit_findings", [])
+                stats = state.get("index_stats")
+                stats_dict = stats.as_dict() if stats else {"embedded": 0, "reused": 0, "removed": 0}
+                write_result = state.get("write_result")
                 self._send_json({
                     "vault": str(vault),
-                    "index": stats.as_dict(),
+                    "index": stats_dict,
                     "suggestions": [item.as_dict() for item in suggestions],
                     "findings": [item.as_dict() for item in findings],
                     "write": {
@@ -535,17 +523,14 @@ class ZettelLinkerRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 config = load_config(vault)
-                notes = discover_notes(vault, config)
-                engine = SemanticEngine(vault, config)
-                stats = engine.refresh(notes)
-                assert engine.graph is not None
-                normalized = normalize_identity(note_param)
-                identity = normalized if normalized in engine.graph.by_identity else engine.graph.by_basename.get(Path(normalized).name, [None])[0].identity
-                suggestions = engine.suggestions_for(identity)
+                state = run_note_suggest(vault, config, note_param)
+                suggestions = state.get("suggestions", [])
+                stats = state.get("index_stats")
+                stats_dict = stats.as_dict() if stats else {"embedded": 0, "reused": 0, "removed": 0}
                 self._send_json({
                     "vault": str(vault),
-                    "note": identity,
-                    "index": stats.as_dict(),
+                    "note": state["note"],
+                    "index": stats_dict,
                     "suggestions": [item.as_dict() for item in suggestions],
                 })
             except Exception as exc:

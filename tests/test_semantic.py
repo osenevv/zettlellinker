@@ -86,6 +86,17 @@ class SemanticTests(unittest.TestCase):
             self.assertEqual(stats["embedded"], 1)
             self.assertEqual(third.suggestions_for("Apple"), [])
 
+    def test_default_index_is_exact(self):
+        engine = SemanticEngine(self.vault, self.config, embedder=FakeEmbedder())
+        self.assertIsInstance(engine.index, ExactIndex)
+        self.assertTrue(str(engine.cache.index_path).endswith("index.npz"))
+
+    def test_usearch_selected_by_config(self):
+        self.config.semantic.index = "usearch"
+        engine = SemanticEngine(self.vault, self.config, embedder=FakeEmbedder())
+        self.assertIsInstance(engine.index, USearchIndex)
+        self.assertTrue(str(engine.cache.index_path).endswith("index.usearch"))
+
     def test_usearch_build_search_and_reload(self):
         index_path = Path(self.temp.name) / "index.usearch"
         index = USearchIndex(self.config.semantic)

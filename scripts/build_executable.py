@@ -35,8 +35,6 @@ def main() -> int:
         str(ROOT / "src"),
         "--collect-all",
         "sentence_transformers",
-        "--collect-all",
-        "usearch",
         "--hidden-import",
         "transformers.models.bert.configuration_bert",
         "--hidden-import",
@@ -47,6 +45,9 @@ def main() -> int:
         "zettellinker.gui_app",
         str(ROOT / "packaging" / "zettellinker_launcher.py"),
     ]
+    if importlib.util.find_spec("usearch") is not None:
+        hidden = command.index("--hidden-import")
+        command[hidden:hidden] = ["--collect-all", "usearch"]
     environment = os.environ.copy()
     environment["PYINSTALLER_CONFIG_DIR"] = str(ROOT / "build" / "pyinstaller-config")
     subprocess.run(command, cwd=ROOT, env=environment, check=True)

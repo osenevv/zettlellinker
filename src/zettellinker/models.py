@@ -81,15 +81,3 @@ class IndexStats:
         return {"embedded": self.embedded, "reused": self.reused, "removed": self.removed}
 
 
-@dataclass(frozen=True)
-class DoctorCheck:
-    ok: bool
-    value: str | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ok": self.ok}
-        if self.value is not None:
-            payload["value"] = self.value
-        return payload
-
-

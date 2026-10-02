@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from collections import Counter
 from dataclasses import asdict
@@ -13,13 +14,10 @@ from . import __version__
 import yaml
 
 from .config import CONFIG_NAME, VaultConfig, load_config, save_config, write_default_config
-from .semantic import (
-    SemanticEngine,
-    mark_model_downloaded,
-    model_download_confirmed,
-)
-from .vault import HEADING_RE, VaultGraph, discover_notes, normalize_identity
-from .writer import LinkWriter, undo_last
+from .semantic import mark_model_downloaded, model_download_confirmed
+from .vault import HEADING_RE, discover_notes
+from .workflow import run_note_suggest, run_vault_audit, run_vault_scan
+from .writer import undo_last
 
 
 AUTO_WRITE_ON = "on"
@@ -27,7 +25,15 @@ AUTO_WRITE_OFF = "off"
 FORMAT_TEXT = "text"
 FORMAT_JSON = "json"
 
-REQUIRED_MODULES = ("numpy", "yaml", "platformdirs", "sentence_transformers", "usearch")
+REQUIRED_MODULES = (
+    "numpy",
+    "yaml",
+    "platformdirs",
+    "sentence_transformers",
+    "langchain",
+    "langchain_core",
+    "langgraph",
+)
 HEADING_KEYWORDS = ("connection", "related", "links")
 
 
@@ -72,6 +78,10 @@ def _parser() -> argparse.ArgumentParser:
     _vault_option(doctor)
     doctor.add_argument("--format", choices=(FORMAT_TEXT, FORMAT_JSON), default=FORMAT_TEXT)
 
+    audit = commands.add_parser("audit", help="Report ghost links, ambiguous links, and orphans")
+    _vault_option(audit)
+    audit.add_argument("--format", choices=(FORMAT_TEXT, FORMAT_JSON), default=FORMAT_TEXT)
+
     gui = commands.add_parser("gui", help="Launch native desktop GUI app window")
     gui.add_argument("--web", action="store_true", help="Launch browser HTTP UI instead of native desktop app window")
     gui.add_argument("--port", type=int, default=8765, help="Port to run GUI server on (when --web is enabled)")
@@ -101,7 +111,7 @@ def _vault(path: Path) -> Path:
 
 
 def _confirm_model(model: str, assume_yes: bool) -> None:
-    if model_download_confirmed(model):
+    if os.environ.get("ZETTELLINKER_TEST_EMBEDDER") == "1" or model_download_confirmed(model):
         return
     message = (
         f"ZettelLinker needs to download {model} (approximately 91 MB) from Hugging Face.\n"
@@ -118,54 +128,41 @@ def _confirm_model(model: str, assume_yes: bool) -> None:
         raise RuntimeError("Model download cancelled")
 
 
-def _load_analysis(args: argparse.Namespace):
-    vault = _vault(args.vault)
-    config = load_config(vault, args.config)
-    if args.threshold is not None:
+def _apply_overrides(args: argparse.Namespace, config: VaultConfig) -> None:
+    if getattr(args, "threshold", None) is not None:
         config.semantic.threshold = args.threshold
-    if args.limit is not None:
+    if getattr(args, "limit", None) is not None:
         config.semantic.limit = args.limit
-    if args.reciprocal_mode is not None:
+    if getattr(args, "reciprocal_mode", None) is not None:
         config.audits.reciprocal_mode = args.reciprocal_mode
     config.validate()
+
+
+def _prepare(args: argparse.Namespace):
+    vault = _vault(args.vault)
+    config = load_config(vault, args.config)
+    _apply_overrides(args, config)
     notes = discover_notes(vault, config)
     if any(note.clean_text for note in notes):
         _confirm_model(config.semantic.model, args.yes)
-    progress = (lambda message: print(message, file=sys.stderr))
-    engine = SemanticEngine(vault, config, progress=progress)
-    stats = engine.refresh(notes)
-    mark_model_downloaded(config.semantic.model)
-    return vault, config, notes, engine, stats
-
-
-def _resolve_requested(graph: VaultGraph, value: str) -> str:
-    normalized = normalize_identity(value)
-    if normalized in graph.by_identity:
-        return normalized
-    matches = graph.by_basename.get(Path(normalized).name, [])
-    if len(matches) == 1:
-        return matches[0].identity
-    if len(matches) > 1:
-        raise ValueError(
-            f"Note name is ambiguous: {value}. Use one of: "
-            + ", ".join(note.relative_path for note in matches)
-        )
-    raise ValueError(f"Note was not found in the vault: {value}")
+    return vault, config, notes
 
 
 def _suggest(args: argparse.Namespace) -> int:
-    _vault_path, config, _notes, engine, stats = _load_analysis(args)
-    assert engine.graph is not None
-    identity = _resolve_requested(engine.graph, args.note)
-    suggestions = engine.suggestions_for(identity)
-    write_result = None
+    vault, config, notes = _prepare(args)
+    progress = lambda message: print(message, file=sys.stderr)
     if config.auto_write.enabled:
-        print(f"Automatic writing enabled; write scope: {identity}", file=sys.stderr)
-        write_result = LinkWriter(engine).apply(suggestions, source_only=identity)
+        print(f"Automatic writing enabled; write scope: {args.note}", file=sys.stderr)
+    state = run_note_suggest(vault, config, args.note, progress=progress, notes=notes)
+    mark_model_downloaded(config.semantic.model)
+    suggestions = state.get("suggestions", [])
+    stats = state.get("index_stats")
+    stats_dict = stats.as_dict() if stats else {"embedded": 0, "reused": 0, "removed": 0}
+    write_result = state.get("write_result")
     payload = {
         "command": "suggest",
-        "note": identity,
-        "index": stats.as_dict(),
+        "note": state["note"],
+        "index": stats_dict,
         "suggestions": [item.as_dict() for item in suggestions],
         "write": _write_payload(write_result),
     }
@@ -174,16 +171,20 @@ def _suggest(args: argparse.Namespace) -> int:
 
 
 def _scan(args: argparse.Namespace) -> int:
-    _vault_path, config, _notes, engine, stats = _load_analysis(args)
-    suggestions = engine.all_suggestions()
-    findings = engine.graph.findings(config) if engine.graph else []
-    write_result = None
+    vault, config, notes = _prepare(args)
+    progress = lambda message: print(message, file=sys.stderr)
     if config.auto_write.enabled:
         print("Automatic writing enabled; write scope: entire vault", file=sys.stderr)
-        write_result = LinkWriter(engine).apply(suggestions)
+    state = run_vault_scan(vault, config, progress=progress, notes=notes)
+    mark_model_downloaded(config.semantic.model)
+    suggestions = state.get("suggestions", [])
+    findings = state.get("audit_findings", [])
+    stats = state.get("index_stats")
+    stats_dict = stats.as_dict() if stats else {"embedded": 0, "reused": 0, "removed": 0}
+    write_result = state.get("write_result")
     payload = {
         "command": "scan",
-        "index": stats.as_dict(),
+        "index": stats_dict,
         "suggestions": [item.as_dict() for item in suggestions],
         "findings": [item.as_dict() for item in findings],
         "write": _write_payload(write_result),
@@ -270,8 +271,8 @@ def _render(payload: dict[str, Any], output_format: str) -> None:
     print(f"Suggestions: {len(suggestions)}")
     for item in suggestions:
         print(f"  {item['source']} -> {item['target']}  {item['score']:.3f}")
-    findings = payload.get("findings", [])
-    if findings:
+    if "findings" in payload:
+        findings = payload["findings"]
         print(f"Findings: {len(findings)}")
         for item in findings:
             target = f" -> {item['target']}" if item.get("target") else ""
@@ -314,8 +315,7 @@ def _undo(args: argparse.Namespace) -> int:
     return 0
 
 
-def _doctor(args: argparse.Namespace) -> int:
-    vault = _vault(args.vault)
+def doctor_checks(vault: Path) -> dict[str, Any]:
     checks: dict[str, Any] = {
         "python": {"ok": sys.version_info >= (3, 11), "value": sys.version.split()[0]},
         "vault_readable": {"ok": vault.exists() and vault.is_dir(), "value": str(vault)},
@@ -324,9 +324,32 @@ def _doctor(args: argparse.Namespace) -> int:
     for module in REQUIRED_MODULES:
         checks[module] = {"ok": importlib.util.find_spec(module) is not None}
     try:
-        load_config(vault)
+        config = load_config(vault)
     except Exception as exc:
         checks["config"] = {"ok": False, "value": str(exc)}
+        config = None
+    if config is not None and config.semantic.index == "usearch":
+        checks["usearch"] = {"ok": importlib.util.find_spec("usearch") is not None}
+    return checks
+
+
+def _audit(args: argparse.Namespace) -> int:
+    vault = _vault(args.vault)
+    config = load_config(vault)
+    config.validate()
+    progress = lambda message: print(message, file=sys.stderr)
+    state = run_vault_audit(vault, config, progress=progress)
+    payload = {
+        "command": "audit",
+        "findings": [item.as_dict() for item in state.get("audit_findings", [])],
+    }
+    _render(payload, args.format)
+    return 0
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    vault = _vault(args.vault)
+    checks = doctor_checks(vault)
     ok = all(check["ok"] for check in checks.values())
     if args.format == FORMAT_JSON:
         print(json.dumps({"ok": ok, "checks": checks}, indent=2))
@@ -353,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
             return _undo(args)
         if args.command == "doctor":
             return _doctor(args)
+        if args.command == "audit":
+            return _audit(args)
         if args.command == "gui":
             if getattr(args, "web", False):
                 from .ui_server import run_ui_server
@@ -365,4 +390,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 

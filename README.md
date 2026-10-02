@@ -95,6 +95,7 @@ Two strategies, in order of preference:
 | Setting | Default | What it controls |
 |---|---|---|
 | Similarity Threshold | `0.60` | Minimum score to suggest a link (0–1). Higher = stricter. |
+| Index | `exact` | `exact` scores every note. `usearch` is an approximate prefilter for large vaults (`pip install 'zettellinker[usearch]'`). |
 | Inline Threshold | `0.72` | Minimum score to insert a link inside sentence text. |
 | Suggestions Limit | `5` | Max suggestions per note. |
 | Connections Heading | `## Connections` | Heading that fallback links are appended under. |
@@ -113,6 +114,7 @@ exclude_name_contains: []     # Skip notes whose name matches these fragments
 exclude_files: []             # Skip specific files by relative path
 semantic:
   model: sentence-transformers/all-MiniLM-L6-v2
+  index: exact               # exact, or usearch for large vaults
   threshold: 0.60
   limit: 5
 audits:
@@ -137,7 +139,46 @@ auto_write:
 | `zettellinker suggest <NOTE>` | Suggestions for one note |
 | `zettellinker settings [OPTIONS]` | View or update settings |
 | `zettellinker undo` | Revert last write |
+| `zettellinker audit` | Ghost links, ambiguous links, orphans. No embeddings |
 | `zettellinker doctor` | Check installation |
+
+---
+
+## Architecture (LangChain & LangGraph)
+
+Scan, suggest, and audit run as LangGraph state graphs. The same graphs are the integration point for other LangChain code.
+
+```
+[START]
+   │
+   ▼
+[discover_notes] ────> Markdown notes, also mapped to LangChain Documents
+   │
+   ▼
+[build_graph] ───────> Vault wikilink graph
+   │
+   ▼
+[audit_vault] ───────> Ghost links, ambiguous links, orphans, missing reciprocals
+   │
+   ▼
+[index_semantic] ────> Local embeddings, cache, and a LangChain VectorStore
+   │
+   ▼
+[generate_suggestions] -> Ranked links
+   │
+   ├── (auto_write enabled?)
+   │        │
+   │        ▼
+   │   [write_links] ──> Inline phrase or the connections heading
+   │        │
+   ▼        ▼
+ [END]   [END]
+```
+
+- `langchain_adapters.py`: `note_to_document` / `document_to_note`, `LangChainEmbedder`, `LangChainZettelVectorStore`, `ZettelVaultRetriever`.
+- `workflow.py`: `create_scan_graph`, `create_suggest_graph`, `create_audit_graph`, and `run_vault_scan` / `run_note_suggest` / `run_vault_audit`.
+- `semantic.index` defaults to `exact`. Set `usearch` for an approximate prefilter on large vaults. Retrieved distances are replaced with exact cosine.
+- The desktop window calls the same runners. Scan and Inspect there are previews. Apply is the only writer in the window. The CLI still writes during `scan` when auto-write is on.
 
 ---
 

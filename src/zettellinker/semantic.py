@@ -155,7 +155,7 @@ class SemanticCache:
     def __init__(self, vault: Path):
         self.directory = cache_directory(vault)
         self.manifest_path = self.directory / "manifest.json"
-        self.index_path = self.directory / "index.usearch"
+        self.index_path = self.directory / "index.npz"
         self.signature = ""
         self.index_fingerprint = ""
         self.entries: dict[str, CacheEntry] = {}
@@ -256,7 +256,7 @@ class USearchIndex:
 
 
 class ExactIndex:
-    """Deterministic test index; production uses USearchIndex."""
+    """Exact cosine search. Default for a vault. USearch is the large-vault option."""
 
     def __init__(self, _config: SemanticConfig):
         self.keys = np.asarray([], dtype=np.int64)
@@ -285,6 +285,25 @@ class ExactIndex:
         return self.keys[order], 1.0 - similarities[order]
 
 
+class DeterministicTestEmbedder:
+    model_id = "test-deterministic"
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        vectors = []
+        for text in texts:
+            lowered = text.lower()
+            v = np.asarray([
+                lowered.count("fruit") + lowered.count("apple") + lowered.count("banana"),
+                lowered.count("quantum") + lowered.count("physics"),
+                lowered.count("health") + lowered.count("nutrition"),
+                lowered.count("software") + lowered.count("ideas") + lowered.count("one") + lowered.count("two"),
+            ], dtype=np.float32)
+            if not v.any():
+                v[3] = 1.0
+            vectors.append(normalize(v))
+        return np.asarray(vectors, dtype=np.float32)
+
+
 class SemanticEngine:
     def __init__(
         self,
@@ -296,14 +315,26 @@ class SemanticEngine:
     ):
         self.vault = vault.resolve()
         self.config = config
-        self.embedder = embedder or SentenceTransformerEmbedder(config.semantic.model)
+        if embedder is not None:
+            self.embedder = embedder
+        elif os.environ.get("ZETTELLINKER_TEST_EMBEDDER") == "1":
+            self.embedder = DeterministicTestEmbedder()
+        else:
+            self.embedder = SentenceTransformerEmbedder(config.semantic.model)
         self.cache = SemanticCache(self.vault)
-        self.index: SearchIndex = (index_factory or USearchIndex)(config.semantic)
+        if index_factory is not None:
+            self.index = index_factory(config.semantic)
+        elif config.semantic.index == "usearch":
+            self.index = USearchIndex(config.semantic)
+        else:
+            self.index = ExactIndex(config.semantic)
+        if isinstance(self.index, USearchIndex):
+            self.cache.index_path = self.cache.directory / "index.usearch"
         self.progress = progress or (lambda _message: None)
         self.graph: VaultGraph | None = None
 
-    def refresh(self, notes: list[Note]) -> IndexStats:
-        self.graph = VaultGraph(notes)
+    def refresh(self, notes: list[Note], graph: VaultGraph | None = None) -> IndexStats:
+        self.graph = graph if graph is not None else VaultGraph(notes)
         self.cache.load()
         signature = semantic_signature(self.config.semantic, self.config.exclude_sections)
         if self.cache.signature != signature:
